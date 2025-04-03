@@ -1,5 +1,5 @@
 ---
-title: "STDM Report"
+title: "STDM ARIMA Report"
 output: html_document
 date: "2025-03-26"
 ---
@@ -8,22 +8,256 @@ date: "2025-03-26"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+## R Markdown for ARIMA Modelling
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+#Loading Packages and Data Preprocessing
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+#Read excel file, install packages if unavailable
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(imputeTS)
+library(ggplot2)
+library(forecast)
+library(spdep)
+library(tseries)
+library(sf)
+library(spData)
+library(spatialreg)
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Reading Excel sheets separately as spatial components are in different sheets
+``` {r}
+data <- read_excel("Design-Hour-Report-2023.xlsx", sheet = "Top 200 Hours by Site", skip = 3)
+site_coordinates <- read_excel("Design-Hour-Report-2023.xlsx", sheet = "Site-Specific Statistics", skip = 4)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+#Rename columns
+``` {r}
+colnames(data) <- c("Site_Number", "Year", NA, NA, "Count_Date", "Day_of_Week", "Hour", "Volume_Rank", "Traffic_Volume", "Decreasing_Dir_Volume", "K_Factor", "D_Factor", NA, NA)
+```
+
+# Select relevant columns and remove unnecessary columns
+```{r}
+data <- data %>% 
+  select(Site_Number, Year, Count_Date, Day_of_Week, Hour, Volume_Rank, Traffic_Volume, K_Factor, D_Factor) %>%
+  drop_na(Site_Number, Count_Date, Traffic_Volume) #Drop rows with missing values
+```
+
+#Convert to POSIXct format on the date and time columns
+```{r}
+data <- data %>%
+  mutate(Count_Date = as.Date(Count_Date),
+         Traffic_Volume = as.numeric(Traffic_Volume),
+         DateTime = as.POSIXct(paste(Count_Date, Hour), format = "%Y-%m-%d %H")
+         )
+```
+
+#Filter data for first station and group by monthly intervals
+```{r}
+data_selected <- data %>%
+  filter(Site_Number == unique(Site_Number) [1]) %>%
+  mutate(Month = floor_date(DateTime, "month")) %>%
+  arrange(DateTime)
+```
+
+#Handle missing values with interpolation
+```{r}
+data_selected$Traffic_Volume <- na_interpolation(data_selected$Traffic_Volume)
+```
+
+#Check for missing values
+```{r}
+sum(is.na(data_selected$Traffic_Volume))
+```
+
+#Apply interpolation to Traffic Volume
+```{r}
+data_selected$Traffic_Volume <- na_interpolation(data_selected$Traffic_Volume)
+```
+
+#Time Series Plot - ESDA for one site
+```{r}
+ggplot(data_selected, aes(x = DateTime, y = Traffic_Volume)) + geom_line(color = "blue") +
+  labs(title = "Traffic Volume Over Time",
+       x = "Date", y = "Traffic Volume") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# KDE as ESDA for Spatial Component, clean map location to separate Lat long first
+
+```{r}
+coords_clean <- site_coordinates %>%
+  select("Site", "Map Location") %>%
+  separate("Map Location", into = c("Latitude", "Longitude"), sep = ",") %>%
+  mutate(Latitude = as.numeric(Latitude), Longitude = as.numeric(Longitude))
+```
+
+```{r}
+data_selected_kde <- data %>%
+  mutate(Month = floor_date(DateTime, "month")) %>%
+  arrange(DateTime)
+```
+
+#Ensure no NA values
+```{r}
+data_selected_kde$Traffic_Volume <- na_interpolation(data_selected_kde$Traffic_Volume)
+```
+
+#Merging
+```{r}
+data_with_coords <- data_selected_kde %>%
+  filter(!is.na(Traffic_Volume)) %>%
+  left_join(coords_clean, by = c("Site_Number" = "Site"))
+```
+
+#Compute the Traffic_Volume_Change column (difference in Traffic Volume)
+```{r}
+data_with_coords <- data_with_coords %>%
+  arrange(Site_Number, DateTime) %>%
+  group_by(Site_Number) %>%
+  mutate(Traffic_Volume_Change = Traffic_Volume - lag(Traffic_Volume)) %>%
+  ungroup()
+```
+
+#Filter out NA values
+```{r}
+data_with_coords <- data_with_coords %>%
+  filter(!is.na(Traffic_Volume_Change))
+```
+
+#KDE plot for all sites
+```{r}
+ggplot(data_with_coords, aes(x = Longitude, y = Latitude)) +
+  geom_density_2d(aes(color = Traffic_Volume_Change)) + scale_color_viridis_c() + labs(title = "Density Estimation of Traffic Volume Change") +
+  theme_minimal()
+```
+
+# ACF and PACF for ARIMA in one site
+# One site is chosen due to the complex nature of the original dataset
+```{r}
+acf(data_selected$Traffic_Volume, main = "ACF ARIMA", lag.max = 36)
+```
+```{r}
+pacf(data_selected$Traffic_Volume, main = "PACF ARIMA", lag.max = 36)
+```
+#Stationarity Check using Augmented Dickey-Fuller (ADF) test
+```{r}
+adf_test <- adf.test(data_selected$Traffic_Volume, alternative = "stationary")
+
+print(adf_test)
+```
+
+# ---ARIMA Model---
+```{r}
+#Estimate parameters and fit ARIMA model with seasonal components
+arima_model <- arima(data_selected$Traffic_Volume, order = c(1,0,1), seasonal = list(order = c(2,0,2), period = 12))
+
+summary(arima_model)
+```
+
+#Diagnostic Checking
+```{r}
+acf(residuals(arima_model))
+```
+
+```{r}
+plot(residuals(arima_model))
+```
+
+```{r}
+#Test using ljung-box test
+ljung_box_test <- Box.test(residuals(arima_model), lag = 12, type = "Ljung-Box")
+print(ljung_box_test)
+```
+
+# p value is more than 0.05 indicating good fit
+
+#Forecast/Predict next 12 values (one step ahead)
+```{r}
+arima_forecast <- predict(arima_model, n.ahead = 12)
+```
+
+#Plot observed vs forecasted (one step ahead) for ARIMA prediction
+```{r}
+# Select the last 12 observed values
+last_12_obs <- tail(data_selected$Traffic_Volume, 12)
+
+# Time index for plotting (aligning forecast with observed values)
+time_index <- seq(length(last_12_obs) + 1,
+                  length(last_12_obs) + 12)
+
+matplot(c(1:12), cbind(last_12_obs, arima_forecast$pred),
+          type = "l",
+          col = c("black", "red"), lty = c(1,2),
+          xlab = "Time", ylab = "Traffic Volume",
+          main = "ARIMA: Observed vs Forecasted")
+```
+
+#Residual Check
+```{r}
+# Check for autocorrelation in residuals
+checkresiduals(arima_model)
+
+# Perform Ljung-Box test
+Box.test(residuals(arima_model), lag = 12, type = "Ljung-Box")
+```
+
+#RMSE for ARIMA
+```{r}
+fitted_values <- fitted(arima_model)
+
+actual_values <- data_selected$Traffic_Volume[(length(data_selected$Traffic_Volume) - length(fitted_values) + 1): length(data_selected$Traffic_Volume)]
+
+#Calculate RMSE
+arima_rmse <- sqrt(mean((fitted_values - actual_values)^2, na.rm = TRUE))
+print(paste("ARIMA RMSE:", arima_rmse))
+```
+
+#ARIMA model Fitting
+```{r}
+#using Arima from forecast package
+fit_Ar <- Arima(data_selected$Traffic_Volume[1:(nrow(data_selected)-12)],
+                order = c(1,0,1), seasonal = list(order = c(2,0,2), period = 12))
+
+pre_Ar <- Arima(data_selected$Traffic_Volume[(nrow(data_selected)-11):nrow(data_selected)],
+                model = fit_Ar)
+
+matplot(cbind(pre_Ar$fitted, pre_Ar$x), type = "l", col = c("red", "black"), lty = c(1,2),
+        xlab = "Time", ylab = "Traffic Volume", main = "ARIMA Predictions")
+```
+
+#Auto ARIMA comparison
+```{r}
+auto_arima_model <- auto.arima(data_selected$Traffic_Volume)
+
+checkresiduals(auto_arima_model)
+
+# Ljung-Box Test
+Box.test(residuals(auto_arima_model), lag = 12, type = "Ljung-Box")
+```
+
+#Model Fitting with Auto ARIMA
+```{r}
+auto_arima_forecast <- forecast(auto_arima_model, n.ahead = 12)
+plot(auto_arima_forecast)
+```
+
+#RMSE for Auto ARIMA
+```{r}
+auto_fitted_values <- fitted(auto_arima_model)
+
+actual_value_auto <- data_selected$Traffic_Volume[(length(data_selected$Traffic_Volume) - length(auto_fitted_values) + 1):length(data_selected$Traffic_Volume)]
+
+#Calculate RMSE
+auto_arima_rmse <- sqrt(mean((auto_fitted_values - actual_value_auto)^2, na.rm = TRUE))
+print(paste("Auto ARIMA RMSE:", auto_arima_rmse))
+```
+
+#Code References for ARIMA modelling and deciding p,d,q values: 
+#https://otexts.com/fpp2/arima-r.html
+#https://www.geo.fu-berlin.de/en/v/soga-r/Advances-statistics/Time-series-analysis/ARIMA-modelling-in-R/index.html
+#https://moodle.ucl.ac.uk/pluginfile.php/8470339/mod_resource/content/24/_book/statistical-modelling-of-time-series-and-spatio-temporal-series.html#the-arima-modelling-framework 
